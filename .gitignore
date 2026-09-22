@@ -810,3 +810,7 @@ frontend/coverage/
 # Wrangler 本地缓存（Cloudflare Worker 部署产生）
 .wrangler/
 deploy/.wrangler/
+
+# 该文件被上面的 `*_test.py` 规则误伤（上游因此漏提交、导致服务无法启动）。
+# 它是运行时必需模块，不是测试文件，单独放行。
+!app/services/notification_test.py

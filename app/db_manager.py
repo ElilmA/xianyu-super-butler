@@ -8377,6 +8377,557 @@ class DBManager:
                 return []
 
 
+    # -------------------- 物流报价表操作 --------------------
+    # 上游公开源码只带了 logistics_* 建表语句，缺少读写方法；
+    # 这里补齐供应 `app/routers/logistics_quote.py`、`app/routers/logistics_agent.py`
+    # 使用的最小 CRUD，不改动任何既有表结构。
+    def list_logistics_quote_books(self, user_id: int) -> List[Dict[str, Any]]:
+        """按更新时间倒序列出当前用户的报价表（默认不含解析明细，减少响应体积）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, filename, file_type, size_bytes, sha256, book_kind,
+                           service_count, route_count, created_at, updated_at
+                    FROM logistics_quote_books
+                    WHERE user_id = ?
+                    ORDER BY datetime(updated_at) DESC, id DESC
+                    """,
+                    (int(user_id),),
+                )
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"获取物流报价表失败: {e}")
+                return []
+
+    def get_logistics_quote_book(
+        self, book_id: int, user_id: int, include_payload: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """读取一本报价表；`include_payload=False` 时省略解析明细。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if include_payload:
+                    cursor.execute(
+                        """
+                        SELECT id, filename, file_type, size_bytes, sha256, book_kind,
+                               service_count, route_count, payload, created_at, updated_at
+                        FROM logistics_quote_books
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (int(book_id), int(user_id)),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT id, filename, file_type, size_bytes, sha256, book_kind,
+                               service_count, route_count, created_at, updated_at
+                        FROM logistics_quote_books
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (int(book_id), int(user_id)),
+                    )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+            except Exception as e:
+                logger.error(f"读取物流报价表失败: {e}")
+                return None
+
+    def upsert_logistics_quote_book(
+        self,
+        user_id: int,
+        filename: str,
+        file_type: str,
+        size_bytes: int,
+        sha256: str,
+        book_kind: Optional[str],
+        service_count: int,
+        route_count: int,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """按 (user_id, sha256) 保存解析结果，同一份文件重复上传时覆盖旧结果。
+
+        返回 ``{"id": int, "replaced": bool}``。
+        """
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM logistics_quote_books WHERE user_id = ? AND sha256 = ?",
+                    (int(user_id), str(sha256)),
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    book_id = int(existing[0])
+                    self._execute_sql(
+                        cursor,
+                        """
+                        UPDATE logistics_quote_books
+                        SET filename = ?, file_type = ?, size_bytes = ?, book_kind = ?,
+                            service_count = ?, route_count = ?, payload = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (
+                            str(filename),
+                            str(file_type or ""),
+                            int(size_bytes or 0),
+                            book_kind,
+                            int(service_count or 0),
+                            int(route_count or 0),
+                            payload_json,
+                            book_id,
+                            int(user_id),
+                        ),
+                    )
+                    self.conn.commit()
+                    return {"id": book_id, "replaced": True}
+
+                self._execute_sql(
+                    cursor,
+                    """
+                    INSERT INTO logistics_quote_books
+                        (user_id, filename, file_type, size_bytes, sha256, book_kind,
+                         service_count, route_count, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(user_id),
+                        str(filename),
+                        str(file_type or ""),
+                        int(size_bytes or 0),
+                        str(sha256),
+                        book_kind,
+                        int(service_count or 0),
+                        int(route_count or 0),
+                        payload_json,
+                    ),
+                )
+                book_id = int(cursor.lastrowid)
+                self.conn.commit()
+                return {"id": book_id, "replaced": False}
+            except Exception as e:
+                logger.error(f"保存物流报价表失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def delete_logistics_quote_book(self, book_id: int, user_id: int) -> bool:
+        """删除报价表本体；线路明细通过 logistics_quote_route_imports.sha256 联动清理。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT sha256, filename FROM logistics_quote_books WHERE id = ? AND user_id = ?",
+                    (int(book_id), int(user_id)),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
+
+                sha256 = row[0] or ""
+                filename = row[1] or ""
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM logistics_quote_books WHERE id = ? AND user_id = ?",
+                    (int(book_id), int(user_id)),
+                )
+                if sha256:
+                    # logistics_quote_routes 对 imports 是 ON DELETE CASCADE
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM logistics_quote_route_imports WHERE user_id = ? AND sha256 = ?",
+                        (int(user_id), str(sha256)),
+                    )
+                    # 兜底：历史数据或手工导入可能用别的 sha 记录了同一份文件
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM logistics_quote_route_imports WHERE user_id = ? AND filename = ?",
+                        (int(user_id), str(filename)),
+                    )
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM logistics_quote_routes WHERE user_id = ? AND import_id NOT IN "
+                        "(SELECT id FROM logistics_quote_route_imports WHERE user_id = ?)",
+                        (int(user_id), int(user_id)),
+                    )
+                self.conn.commit()
+                logger.info(f"已删除物流报价表 id={book_id} (user_id={user_id})")
+                return True
+            except Exception as e:
+                logger.error(f"删除物流报价表失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def sync_logistics_quote_routes(
+        self,
+        user_id: int,
+        filename: str,
+        file_type: str,
+        size_bytes: int,
+        sha256: str,
+        book_kind: Optional[str],
+        payload: Dict[str, Any],
+        warnings: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """把解析出的线路写进 ``logistics_quote_routes``，供地址匹配/计费查询。
+
+        返回 ``{"import_id": int, "route_count": int, "skipped": int}``。
+        """
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        rows = rows if isinstance(rows, list) else []
+        warnings_json = json.dumps(list(warnings or []), ensure_ascii=False)
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM logistics_quote_route_imports WHERE user_id = ? AND sha256 = ?",
+                    (int(user_id), str(sha256)),
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    import_id = int(existing[0])
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM logistics_quote_routes WHERE import_id = ? AND user_id = ?",
+                        (import_id, int(user_id)),
+                    )
+                    self._execute_sql(
+                        cursor,
+                        """
+                        UPDATE logistics_quote_route_imports
+                        SET filename = ?, file_type = ?, size_bytes = ?, book_kind = ?,
+                            status = 'completed', warnings = ?, created_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            str(filename),
+                            str(file_type or ""),
+                            int(size_bytes or 0),
+                            book_kind,
+                            warnings_json,
+                            import_id,
+                        ),
+                    )
+                else:
+                    self._execute_sql(
+                        cursor,
+                        """
+                        INSERT INTO logistics_quote_route_imports
+                            (user_id, filename, file_type, size_bytes, sha256, book_kind, warnings)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(user_id),
+                            str(filename),
+                            str(file_type or ""),
+                            int(size_bytes or 0),
+                            str(sha256),
+                            book_kind,
+                            warnings_json,
+                        ),
+                    )
+                    import_id = int(cursor.lastrowid)
+
+                inserted = 0
+                skipped = 0
+                seen_routes = set()
+                for row in rows:
+                    if not isinstance(row, dict):
+                        skipped += 1
+                        continue
+                    carrier = str(row.get("carrier") or "").strip()
+                    origin_city = str(row.get("origin_city") or "").strip()
+                    destination_city = str(row.get("destination_city") or "").strip()
+                    if not carrier or not destination_city:
+                        # 没有承运商或没有目的地的行无法参与匹配
+                        skipped += 1
+                        continue
+
+                    dedup_key = (
+                        carrier,
+                        str(row.get("book_kind") or book_kind or ""),
+                        str(row.get("origin_province") or ""),
+                        origin_city,
+                        str(row.get("destination_province") or ""),
+                        destination_city,
+                    )
+                    if dedup_key in seen_routes:
+                        skipped += 1
+                        continue
+                    seen_routes.add(dedup_key)
+
+                    self._execute_sql(
+                        cursor,
+                        """
+                        INSERT INTO logistics_quote_routes
+                            (user_id, import_id, carrier, book_kind, origin_province, origin_city,
+                             dest_province, dest_city, price_model)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(user_id),
+                            import_id,
+                            carrier,
+                            row.get("book_kind") or book_kind,
+                            str(row.get("origin_province") or ""),
+                            origin_city,
+                            str(row.get("destination_province") or ""),
+                            destination_city,
+                            json.dumps(
+                                {
+                                    "rule_type": row.get("rule_type"),
+                                    "first_weight_kg": row.get("first_weight_kg"),
+                                    "first_price": row.get("first_price"),
+                                    "continued_unit_kg": row.get("continued_unit_kg"),
+                                    "continued_price": row.get("continued_price"),
+                                    "continued_tiers": row.get("continued_tiers"),
+                                    "fixed_tiers": row.get("fixed_tiers"),
+                                    "quote": row.get("quote"),
+                                    "min_price": row.get("min_price"),
+                                    "eta": row.get("eta"),
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+                    inserted += 1
+
+                self._execute_sql(
+                    cursor,
+                    """
+                    UPDATE logistics_quote_route_imports
+                    SET service_count = ?, route_count = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        int(payload.get("service_count") or 0),
+                        inserted,
+                        import_id,
+                    ),
+                )
+                self.conn.commit()
+                return {"import_id": import_id, "route_count": inserted, "skipped": skipped}
+            except Exception as e:
+                logger.error(f"同步物流报价线路失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def list_logistics_quote_routes(
+        self, user_id: int, book_kind: Optional[str] = None, limit: int = 2000
+    ) -> List[Dict[str, Any]]:
+        """列出已导入线路，用于 Agent 端做地址匹配演示与排查。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                sql = (
+                    "SELECT id, import_id, carrier, book_kind, origin_province, origin_city, "
+                    "dest_province, dest_city, price_model FROM logistics_quote_routes "
+                    "WHERE user_id = ?"
+                )
+                params: List[Any] = [int(user_id)]
+                if book_kind:
+                    sql += " AND book_kind = ?"
+                    params.append(str(book_kind))
+                sql += " ORDER BY id DESC LIMIT ?"
+                params.append(max(1, min(int(limit), 5000)))
+
+                cursor.execute(sql, tuple(params))
+                columns = [description[0] for description in cursor.description]
+                routes: List[Dict[str, Any]] = []
+                for row in cursor.fetchall():
+                    item = dict(zip(columns, row))
+                    model = item.get("price_model")
+                    if isinstance(model, str):
+                        try:
+                            item["price_model"] = json.loads(model)
+                        except (TypeError, ValueError):
+                            item["price_model"] = {}
+                    routes.append(item)
+                return routes
+            except Exception as e:
+                logger.error(f"获取物流报价线路失败: {e}")
+                return []
+
+    # -------------------- 物流 Agent 配置/训练样本 --------------------
+    def get_logistics_agent_settings(self, cookie_id: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT cookie_id, enabled, model_name, book_ids, auto_send, recommend_mode,
+                           no_route_policy, item_scope, item_ids, carrier_config,
+                           default_volume_ratios, pricing_config, templates, created_at, updated_at
+                    FROM logistics_agent_settings
+                    WHERE cookie_id = ?
+                    """,
+                    (str(cookie_id),),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+            except Exception as e:
+                logger.error(f"获取物流 Agent 配置失败: {e}")
+                return None
+
+    def upsert_logistics_agent_settings(
+        self, cookie_id: str, values: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """保存物流 Agent 配置；未提供的字段保持原值（没有记录时用表默认值）。"""
+        allowed = {
+            "enabled",
+            "model_name",
+            "book_ids",
+            "auto_send",
+            "recommend_mode",
+            "no_route_policy",
+            "item_scope",
+            "item_ids",
+            "carrier_config",
+            "default_volume_ratios",
+            "pricing_config",
+            "templates",
+        }
+        payload = {key: values[key] for key in values if key in allowed}
+        if not payload:
+            existing = self.get_logistics_agent_settings(cookie_id)
+            return existing or {"cookie_id": cookie_id}
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "INSERT OR IGNORE INTO logistics_agent_settings (cookie_id) VALUES (?)",
+                    (str(cookie_id),),
+                )
+                assignments = ", ".join(f"{key} = ?" for key in payload)
+                params = list(payload.values()) + [str(cookie_id)]
+                self._execute_sql(
+                    cursor,
+                    f"UPDATE logistics_agent_settings SET {assignments}, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE cookie_id = ?",
+                    tuple(params),
+                )
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"保存物流 Agent 配置失败: {e}")
+                self.conn.rollback()
+                raise
+
+        return self.get_logistics_agent_settings(cookie_id) or {"cookie_id": cookie_id}
+
+    def list_logistics_training_rounds(self, user_id: int, cookie_id: str = None) -> List[Dict[str, Any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                sql = (
+                    "SELECT id, cookie_id, thread_id, name, messages_json, created_at "
+                    "FROM logistics_agent_training_rounds WHERE user_id = ?"
+                )
+                params: List[Any] = [int(user_id)]
+                if cookie_id:
+                    sql += " AND cookie_id = ?"
+                    params.append(str(cookie_id))
+                sql += " ORDER BY datetime(created_at) DESC, id DESC LIMIT 200"
+                cursor.execute(sql, tuple(params))
+                columns = [description[0] for description in cursor.description]
+                rounds: List[Dict[str, Any]] = []
+                for row in cursor.fetchall():
+                    item = dict(zip(columns, row))
+                    messages = item.pop("messages_json", "[]")
+                    if isinstance(messages, str):
+                        try:
+                            item["messages"] = json.loads(messages)
+                        except (TypeError, ValueError):
+                            item["messages"] = []
+                    else:
+                        item["messages"] = messages
+                    rounds.append(item)
+                return rounds
+            except Exception as e:
+                logger.error(f"获取物流 Agent 训练轮次失败: {e}")
+                return []
+
+    def save_logistics_training_round(
+        self,
+        user_id: int,
+        cookie_id: str,
+        thread_id: str,
+        name: str,
+        messages: List[Dict[str, Any]],
+        round_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """保存一轮训练对话；``round_id`` 相同则覆盖。返回轮次 ID。"""
+        new_id = str(round_id or f"round-{int(time.time() * 1000)}")
+        messages_json = json.dumps(list(messages or []), ensure_ascii=False)
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    """
+                    INSERT INTO logistics_agent_training_rounds
+                        (id, user_id, cookie_id, thread_id, name, messages_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        messages_json = excluded.messages_json,
+                        cookie_id = excluded.cookie_id,
+                        thread_id = excluded.thread_id
+                    WHERE logistics_agent_training_rounds.user_id = excluded.user_id
+                    """,
+                    (
+                        new_id,
+                        int(user_id),
+                        str(cookie_id),
+                        str(thread_id),
+                        str(name or ""),
+                        messages_json,
+                    ),
+                )
+                # ON CONFLICT ... WHERE 命中时不会更新别人的数据，这里复核归属再返回
+                cursor.execute(
+                    "SELECT id FROM logistics_agent_training_rounds WHERE id = ? AND user_id = ?",
+                    (new_id, int(user_id)),
+                )
+                owned = cursor.fetchone()
+                self.conn.commit()
+                if not owned:
+                    logger.warning(f"训练轮次 {new_id} 属于其他用户，已拒绝覆盖")
+                    return None
+                return new_id
+            except Exception as e:
+                logger.error(f"保存物流 Agent 训练轮次失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def delete_logistics_training_round(self, round_id: str, user_id: int) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM logistics_agent_training_rounds WHERE id = ? AND user_id = ?",
+                    (str(round_id), int(user_id)),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除物流 Agent 训练轮次失败: {e}")
+                self.conn.rollback()
+                return False
+
+
 # 全局单例
 db_manager = DBManager()
 
